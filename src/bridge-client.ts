@@ -1,7 +1,8 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'crypto';
 
-const COMMAND_TIMEOUT_MS = 60_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
+const MAX_COMMAND_TIMEOUT_MS = 120_000;
 const RECONNECT_DELAY_MS = 3_000;
 
 interface BridgeCommand {
@@ -90,10 +91,14 @@ export class BridgeClient {
     }
   }
 
-  async command(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  async command(action: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
     if (!this.ws || !this.connected) {
       await this.connect();
     }
+    const requestedTimeout = Number(timeoutMs ?? params.timeoutMs);
+    const commandTimeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.max(1_000, Math.min(MAX_COMMAND_TIMEOUT_MS, Math.floor(requestedTimeout)))
+      : DEFAULT_COMMAND_TIMEOUT_MS;
     const id = randomUUID();
     const cmd: BridgeCommand = {
       type: 'command',
@@ -104,8 +109,8 @@ export class BridgeClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Bridge command '${action}' timed out after ${COMMAND_TIMEOUT_MS}ms`));
-      }, COMMAND_TIMEOUT_MS);
+        reject(new Error(`Bridge command '${action}' timed out after ${commandTimeoutMs}ms`));
+      }, commandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.ws!.send(JSON.stringify(cmd));
     });

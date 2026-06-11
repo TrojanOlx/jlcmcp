@@ -5,9 +5,12 @@ import { registerStateTools } from './tools/state.js';
 import { registerComponentTools } from './tools/components.js';
 import { registerRoutingTools } from './tools/routing.js';
 import { registerCopperKeepoutTools } from './tools/copper-keepout.js';
+import { registerPcbDocumentTools } from './tools/pcb-document.js';
 import { registerSilkscreenTools } from './tools/silkscreen.js';
 import { registerAdvancedTools } from './tools/advanced.js';
 import { registerSchematicTools } from './tools/schematic.js';
+import { registerProjectTools } from './tools/project.js';
+import { registerDeveloperTools } from './tools/developer.js';
 import { registerAgentTools } from './tools/agent.js';
 import { registerCalculatorTools } from './tools/calculators.js';
 
@@ -24,9 +27,12 @@ async function main() {
   registerComponentTools(server, bridge);
   registerRoutingTools(server, bridge);
   registerCopperKeepoutTools(server, bridge);
+  registerPcbDocumentTools(server, bridge);
   registerSilkscreenTools(server, bridge);
   registerAdvancedTools(server, bridge);
+  registerProjectTools(server, bridge);
   registerSchematicTools(server, bridge);
+  registerDeveloperTools(server, bridge);
   registerAgentTools(server, bridge);
   registerCalculatorTools(server);
 

@@ -23,6 +23,7 @@ const WS_RECONNECT_MS = 3000;
 let wsConnection: WebSocket | null = null;
 let wsConnected = false;
 let wsReconnectHandle: ReturnType<typeof setTimeout> | null = null;
+let activationStarted = false;
 
 type BridgeCommand = {
   id: string;
@@ -138,15 +139,25 @@ function showError(title: string, error: unknown): void {
 
 function appendLog(message: string): void {
   void (async () => {
-    await ensureBridgeDir();
-    const line = `${new Date().toISOString()} ${message}\n`;
-    const prev = (await readTextFile(LOG_FILE)) || '';
-    await writeTextFile(LOG_FILE, prev + line);
+    try {
+      await ensureBridgeDir();
+      const line = `${new Date().toISOString()} ${message}\n`;
+      const prev = (await readTextFile(LOG_FILE)) || '';
+      await writeTextFile(LOG_FILE, prev + line);
+    } catch {
+      // File logging is best-effort; sys_Log/console are the primary diagnostics.
+    }
   })();
 }
 
 function log(message: string): void {
   console.log(`[${APP_NAME}] ${message}`);
+  try {
+    const logType = (globalThis as any).ESYS_LogType?.INFO ?? 0;
+    anyEda()?.sys_Log?.add?.(`[${APP_NAME}] ${message}`, logType);
+  } catch {
+    // ignore logging failures
+  }
   appendLog(message);
 }
 
@@ -1290,6 +1301,110 @@ function getPrimitiveId(primitive: any): string {
   return '';
 }
 
+function getterNameToKey(getterName: string): string {
+  const raw = getterName.replace(/^getState_/, '');
+  return raw.charAt(0).toLowerCase() + raw.slice(1);
+}
+
+function readStateGetterSnapshot(target: any, seen: WeakSet<object>, depth: number): Record<string, any> {
+  const out: Record<string, any> = {};
+  const visitedNames = new Set<string>();
+  let cursor = target;
+
+  while (cursor && cursor !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(cursor)) {
+      if (visitedNames.has(name) || !name.startsWith('getState_')) continue;
+      visitedNames.add(name);
+
+      try {
+        const getter = target?.[name];
+        if (typeof getter !== 'function' || getter.length !== 0) continue;
+        out[getterNameToKey(name)] = cloneForBridge(getter.call(target), seen, depth + 1);
+      } catch {
+        // Some EDA getters are context-sensitive; skip ones that throw.
+      }
+    }
+    cursor = Object.getPrototypeOf(cursor);
+  }
+
+  return out;
+}
+
+function cloneForBridge(value: any, seen = new WeakSet<object>(), depth = 0): any {
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'function') return `[Function ${value.name || 'anonymous'}]`;
+  if (depth > 8) return '[MaxDepth]';
+
+  if (typeof Blob !== 'undefined' && value instanceof Blob) {
+    return {
+      type: 'Blob',
+      mimeType: value.type || '',
+      size: value.size,
+      name: typeof File !== 'undefined' && value instanceof File ? value.name : undefined,
+    };
+  }
+
+  if (value instanceof Date) return value.toISOString();
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => cloneForBridge(item, seen, depth + 1));
+    }
+
+    const out: Record<string, any> = readStateGetterSnapshot(value, seen, depth);
+    for (const key of Object.keys(value)) {
+      out[key] = cloneForBridge(value[key], seen, depth + 1);
+    }
+
+    if (Object.keys(out).length === 0) {
+      try {
+        return String(value);
+      } catch {
+        return '[Object]';
+      }
+    }
+    return out;
+  }
+
+  return String(value);
+}
+
+async function executeEdaCode(params: { code: string; params?: any; timeoutMs?: number }): Promise<any> {
+  const code = String(params?.code || '').trim();
+  if (!code) throw new Error('code is required');
+
+  const timeoutMs = Math.max(1000, Math.min(120000, Math.floor(toFinite(params?.timeoutMs, 30000))));
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  const helpers = {
+    sleep: waitMs,
+    serialize: (value: any) => cloneForBridge(value),
+    toJson: (value: any) => JSON.stringify(cloneForBridge(value)),
+  };
+
+  const body = `
+    "use strict";
+    return await (async () => {
+      ${code}
+    })();
+  `;
+
+  const execution = (async () => {
+    const fn = new AsyncFunction('eda', 'params', 'helpers', body);
+    return cloneForBridge(await fn(eda, params?.params ?? {}, helpers));
+  })();
+
+  const timeout = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`eda_execute timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  return await Promise.race([execution, timeout]);
+}
+
 function makeRectPolygon(params: { x1: number; y1: number; x2: number; y2: number }): any {
   const api = anyEda();
   const sourceLine = makeRectPolygonSource(params.x1, params.y1, params.x2, params.y2);
@@ -1793,10 +1908,497 @@ async function createPcbComponent(params: {
   return { primitiveId, designator };
 }
 
+function serializeLibraryDevice(row: any): any {
+  return {
+    uuid: String(row?.uuid || ''),
+    libraryUuid: String(row?.libraryUuid || ''),
+    name: String(row?.name || ''),
+    description: row?.description ? String(row.description) : '',
+    manufacturer: row?.manufacturer ? String(row.manufacturer) : '',
+    manufacturerId: row?.manufacturerId ? String(row.manufacturerId) : '',
+    supplier: row?.supplier ? String(row.supplier) : '',
+    supplierId: row?.supplierId ? String(row.supplierId) : '',
+    symbol: row?.symbol ? {
+      name: String(row.symbol.name || ''),
+      uuid: String(row.symbol.uuid || ''),
+      libraryUuid: String(row.symbol.libraryUuid || ''),
+    } : {
+      name: String(row?.symbolName || ''),
+      uuid: String(row?.symbolUuid || ''),
+      libraryUuid: String(row?.libraryUuid || ''),
+    },
+    footprint: row?.footprint ? {
+      name: String(row.footprint.name || ''),
+      uuid: String(row.footprint.uuid || ''),
+      libraryUuid: String(row.footprint.libraryUuid || ''),
+    } : row?.footprintUuid ? {
+      name: String(row?.footprintName || ''),
+      uuid: String(row.footprintUuid || ''),
+      libraryUuid: String(row?.libraryUuid || ''),
+    } : undefined,
+    lcscInventory: Number.isFinite(Number(row?.lcscInventory)) ? Number(row.lcscInventory) : undefined,
+    jlcInventory: Number.isFinite(Number(row?.jlcInventory)) ? Number(row.jlcInventory) : undefined,
+  };
+}
+
+async function searchLibraryDevices(params: {
+  key: string;
+  libraryUuid?: string;
+  itemsOfPage?: number;
+  page?: number;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.lib_Device?.search) {
+    throw new Error('current EDA does not support lib_Device.search');
+  }
+  const key = String(params?.key || '').trim();
+  if (!key) throw new Error('key is required');
+  const itemsOfPage = Math.max(1, Math.min(50, Number(params?.itemsOfPage || 10)));
+  const page = Math.max(1, Number(params?.page || 1));
+  const rows = await api.lib_Device.search(
+    key,
+    params?.libraryUuid ? String(params.libraryUuid) : undefined,
+    undefined,
+    undefined,
+    itemsOfPage,
+    page,
+  );
+  const devices = (Array.isArray(rows) ? rows : []).map(serializeLibraryDevice);
+  return { key, page, itemsOfPage, totalReturned: devices.length, devices };
+}
+
+async function getDevicesByLcscIds(params: {
+  lcscIds: string | string[];
+  libraryUuid?: string;
+  allowMultiMatch?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.lib_Device?.getByLcscIds) {
+    throw new Error('current EDA does not support lib_Device.getByLcscIds');
+  }
+  const lcscIds = Array.isArray(params?.lcscIds)
+    ? params.lcscIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : String(params?.lcscIds || '').split(',').map((id) => id.trim()).filter(Boolean);
+  if (lcscIds.length === 0) throw new Error('lcscIds is required');
+  const raw = await api.lib_Device.getByLcscIds(
+    lcscIds.length === 1 ? lcscIds[0] : lcscIds,
+    params?.libraryUuid ? String(params.libraryUuid) : undefined,
+    Boolean(params?.allowMultiMatch),
+  );
+  const rows = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  return { lcscIds, totalReturned: rows.length, devices: rows.map(serializeLibraryDevice) };
+}
+
+async function createSchematicComponent(params: {
+  component: { libraryUuid: string; uuid: string };
+  x: number;
+  y: number;
+  subPartName?: string;
+  rotation?: number;
+  mirror?: boolean;
+  addIntoBom?: boolean;
+  addIntoPcb?: boolean;
+  designator?: string;
+  name?: string;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.create) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.create');
+  }
+  const { component, x, y } = params;
+  if (!component?.libraryUuid || !component?.uuid) {
+    throw new Error('component.libraryUuid and component.uuid are required');
+  }
+  const result = await api.sch_PrimitiveComponent.create(
+    { libraryUuid: component.libraryUuid, uuid: component.uuid },
+    Number(x),
+    Number(y),
+    params?.subPartName ? String(params.subPartName) : undefined,
+    Number(params?.rotation || 0),
+    Boolean(params?.mirror),
+    params?.addIntoBom !== false,
+    params?.addIntoPcb !== false,
+  );
+  if (!result) throw new Error('failed to create schematic component');
+
+  if (params?.designator || params?.name) {
+    await api.sch_PrimitiveComponent.modify(result, {
+      designator: params?.designator ? String(params.designator) : undefined,
+      name: params?.name ? String(params.name) : undefined,
+    });
+  }
+
+  return {
+    primitiveId: getPrimitiveId(result),
+    designator: result?.getState_Designator?.() || params?.designator || '',
+    name: result?.getState_Name?.() || params?.name || '',
+    x,
+    y,
+  };
+}
+
+async function createSchematicNetFlag(params: {
+  identification?: 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround';
+  net: string;
+  x: number;
+  y: number;
+  rotation?: number;
+  mirror?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.createNetFlag) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.createNetFlag');
+  }
+  const net = String(params?.net || '').trim();
+  if (!net) throw new Error('net is required');
+  const result = await api.sch_PrimitiveComponent.createNetFlag(
+    params?.identification || (net.toUpperCase().includes('GND') ? 'Ground' : 'Power'),
+    net,
+    Number(params.x),
+    Number(params.y),
+    Number(params?.rotation || 0),
+    Boolean(params?.mirror),
+  );
+  if (!result) throw new Error('failed to create schematic net flag');
+  return { primitiveId: getPrimitiveId(result), net, x: params.x, y: params.y };
+}
+
+async function createSchematicNetPort(params: {
+  direction?: 'IN' | 'OUT' | 'BI';
+  net: string;
+  x: number;
+  y: number;
+  rotation?: number;
+  mirror?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.createNetPort) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.createNetPort');
+  }
+  const net = String(params?.net || '').trim();
+  if (!net) throw new Error('net is required');
+  const result = await api.sch_PrimitiveComponent.createNetPort(
+    params?.direction || 'BI',
+    net,
+    Number(params.x),
+    Number(params.y),
+    Number(params?.rotation || 0),
+    Boolean(params?.mirror),
+  );
+  if (!result) throw new Error('failed to create schematic net port');
+  return { primitiveId: getPrimitiveId(result), net, x: params.x, y: params.y };
+}
+
+async function createSchematicWire(params: {
+  line: number[] | number[][];
+  net?: string;
+  color?: string | null;
+  lineWidth?: number | null;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveWire?.create) {
+    throw new Error('current EDA does not support sch_PrimitiveWire.create');
+  }
+  if (!Array.isArray(params?.line) || params.line.length === 0) {
+    throw new Error('line is required');
+  }
+  const result = await api.sch_PrimitiveWire.create(
+    params.line,
+    params?.net ? String(params.net) : undefined,
+    params?.color ?? null,
+    params?.lineWidth ?? null,
+    null,
+  );
+  if (!result) throw new Error('failed to create schematic wire');
+  return {
+    primitiveId: getPrimitiveId(result),
+    net: result?.getState_Net?.() || params?.net || '',
+    line: params.line,
+  };
+}
+
+async function getProjectTree(): Promise<any> {
+  const api = anyEda();
+  const result: Record<string, any> = {};
+
+  if (api?.dmt_Project?.getCurrentProjectInfo) {
+    result.currentProject = cloneForBridge(await api.dmt_Project.getCurrentProjectInfo());
+  }
+  if (api?.dmt_Board?.getAllBoardsInfo) {
+    result.boards = cloneForBridge(await api.dmt_Board.getAllBoardsInfo());
+  }
+  if (api?.dmt_Board?.getCurrentBoardInfo) {
+    result.currentBoard = cloneForBridge(await api.dmt_Board.getCurrentBoardInfo());
+  }
+  if (api?.dmt_Schematic?.getAllSchematicsInfo) {
+    result.schematics = cloneForBridge(await api.dmt_Schematic.getAllSchematicsInfo());
+  }
+  if (api?.dmt_Schematic?.getAllSchematicPagesInfo) {
+    result.schematicPages = cloneForBridge(await api.dmt_Schematic.getAllSchematicPagesInfo());
+  }
+  if (api?.dmt_SelectControl?.getCurrentDocumentInfo) {
+    result.currentDocument = cloneForBridge(await api.dmt_SelectControl.getCurrentDocumentInfo());
+  }
+  if (api?.dmt_EditorControl?.getSplitScreenTree) {
+    result.splitScreenTree = cloneForBridge(await api.dmt_EditorControl.getSplitScreenTree());
+  }
+
+  return result;
+}
+
+async function createBoard(params: { schematicUuid?: string; pcbUuid?: string; boardName?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.dmt_Board?.createBoard) {
+    throw new Error('current EDA does not support dmt_Board.createBoard');
+  }
+
+  const originalBoardName = await api.dmt_Board.createBoard(
+    params?.schematicUuid ? String(params.schematicUuid) : undefined,
+    params?.pcbUuid ? String(params.pcbUuid) : undefined,
+  );
+  if (!originalBoardName) throw new Error('failed to create board');
+
+  let boardName = String(originalBoardName);
+  const requestedName = String(params?.boardName || '').trim();
+  if (requestedName && requestedName !== boardName) {
+    if (!api?.dmt_Board?.modifyBoardName) {
+      throw new Error('board created but dmt_Board.modifyBoardName is unavailable');
+    }
+    const renamed = await api.dmt_Board.modifyBoardName(boardName, requestedName);
+    if (renamed) boardName = requestedName;
+  }
+
+  const boardInfo = api?.dmt_Board?.getBoardInfo ? await api.dmt_Board.getBoardInfo(boardName) : undefined;
+  return { boardName, boardInfo: cloneForBridge(boardInfo) };
+}
+
+async function createSchematicDocument(params: {
+  boardName?: string;
+  schematicName?: string;
+  createPage?: boolean;
+  pageName?: string;
+  open?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.dmt_Schematic?.createSchematic) {
+    throw new Error('current EDA does not support dmt_Schematic.createSchematic');
+  }
+
+  const schematicUuid = await api.dmt_Schematic.createSchematic(
+    params?.boardName ? String(params.boardName) : undefined,
+  );
+  if (!schematicUuid) throw new Error('failed to create schematic');
+
+  const schematicName = String(params?.schematicName || '').trim();
+  if (schematicName && api?.dmt_Schematic?.modifySchematicName) {
+    await api.dmt_Schematic.modifySchematicName(schematicUuid, schematicName);
+  }
+
+  let pageUuid: string | undefined;
+  if (params?.createPage !== false && api?.dmt_Schematic?.createSchematicPage) {
+    pageUuid = await api.dmt_Schematic.createSchematicPage(schematicUuid);
+    const pageName = String(params?.pageName || '').trim();
+    if (pageUuid && pageName && api?.dmt_Schematic?.modifySchematicPageName) {
+      await api.dmt_Schematic.modifySchematicPageName(pageUuid, pageName);
+    }
+  }
+
+  let tabId: string | undefined;
+  if (params?.open !== false && api?.dmt_EditorControl?.openDocument) {
+    tabId = await api.dmt_EditorControl.openDocument(pageUuid || schematicUuid);
+  }
+
+  return {
+    schematicUuid,
+    pageUuid: pageUuid || null,
+    tabId: tabId || null,
+    schematicInfo: api?.dmt_Schematic?.getSchematicInfo ? cloneForBridge(await api.dmt_Schematic.getSchematicInfo(schematicUuid)) : null,
+    pageInfo: pageUuid && api?.dmt_Schematic?.getSchematicPageInfo ? cloneForBridge(await api.dmt_Schematic.getSchematicPageInfo(pageUuid)) : null,
+  };
+}
+
+async function createSchematicPage(params: {
+  schematicUuid: string;
+  pageName?: string;
+  open?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.dmt_Schematic?.createSchematicPage) {
+    throw new Error('current EDA does not support dmt_Schematic.createSchematicPage');
+  }
+  const schematicUuid = String(params?.schematicUuid || '').trim();
+  if (!schematicUuid) throw new Error('schematicUuid is required');
+
+  const pageUuid = await api.dmt_Schematic.createSchematicPage(schematicUuid);
+  if (!pageUuid) throw new Error('failed to create schematic page');
+
+  const pageName = String(params?.pageName || '').trim();
+  if (pageName && api?.dmt_Schematic?.modifySchematicPageName) {
+    await api.dmt_Schematic.modifySchematicPageName(pageUuid, pageName);
+  }
+
+  let tabId: string | undefined;
+  if (params?.open !== false && api?.dmt_EditorControl?.openDocument) {
+    tabId = await api.dmt_EditorControl.openDocument(pageUuid);
+  }
+
+  return {
+    schematicUuid,
+    pageUuid,
+    tabId: tabId || null,
+    pageInfo: api?.dmt_Schematic?.getSchematicPageInfo ? cloneForBridge(await api.dmt_Schematic.getSchematicPageInfo(pageUuid)) : null,
+  };
+}
+
+async function importPcbChanges(params: { uuid?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Document?.importChanges) {
+    throw new Error('current EDA does not support pcb_Document.importChanges');
+  }
+  const uuid = String(params?.uuid || '').trim() || undefined;
+  const imported = await api.pcb_Document.importChanges(uuid);
+  return { imported: Boolean(imported), uuid: uuid || null };
+}
+
+async function savePcbDocument(params: { uuid?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Document?.save) {
+    throw new Error('current EDA does not support pcb_Document.save');
+  }
+  const uuid = String(params?.uuid || '').trim() || undefined;
+  const saved = await api.pcb_Document.save(uuid);
+  return { saved: saved !== false, uuid: uuid || null };
+}
+
+async function saveSchematicDocument(): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_Document?.save) {
+    throw new Error('current EDA does not support sch_Document.save');
+  }
+  const saved = await api.sch_Document.save();
+  return { saved: saved !== false };
+}
+
+async function clearPcbRouting(params: { uuid?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Document?.clearRouting) {
+    throw new Error('current EDA does not support pcb_Document.clearRouting');
+  }
+  const uuid = String(params?.uuid || '').trim() || undefined;
+  const cleared = await api.pcb_Document.clearRouting(uuid);
+  return { cleared: cleared !== false, uuid: uuid || null };
+}
+
+async function getPcbNets(params: { includePrimitives?: boolean; primitiveTypes?: string[] }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Net?.getAllNets && !api?.pcb_Net?.getAllNetsName) {
+    throw new Error('current EDA does not support pcb_Net net queries');
+  }
+
+  const rawNets = api?.pcb_Net?.getAllNets
+    ? await api.pcb_Net.getAllNets()
+    : (await api.pcb_Net.getAllNetsName()).map((net: string) => ({ net }));
+  const nets = cloneForBridge(Array.isArray(rawNets) ? rawNets : []);
+
+  if (params?.includePrimitives && api?.pcb_Net?.getAllPrimitivesByNet) {
+    const primitiveTypes = Array.isArray(params?.primitiveTypes) ? params.primitiveTypes : undefined;
+    for (const netInfo of nets) {
+      const netName = String(netInfo?.net || netInfo?.name || '').trim();
+      if (!netName) continue;
+      try {
+        netInfo.primitives = cloneForBridge(await api.pcb_Net.getAllPrimitivesByNet(netName, primitiveTypes));
+      } catch (error) {
+        netInfo.primitiveError = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+
+  return { nets, count: nets.length };
+}
+
+async function getPcbNetlist(params: { type?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Net?.getNetlist) {
+    throw new Error('current EDA does not support pcb_Net.getNetlist');
+  }
+  const type = String(params?.type || '').trim() || undefined;
+  const netlist = await api.pcb_Net.getNetlist(type);
+  return { type: type || null, netlist: typeof netlist === 'string' ? netlist : JSON.stringify(cloneForBridge(netlist)) };
+}
+
+async function setPcbNetlist(params: { type?: string; netlist: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Net?.setNetlist) {
+    throw new Error('current EDA does not support pcb_Net.setNetlist');
+  }
+  const netlist = String(params?.netlist || '');
+  if (!netlist.trim()) throw new Error('netlist is required');
+  const type = String(params?.type || '').trim() || undefined;
+  const ok = await api.pcb_Net.setNetlist(type, netlist);
+  return { updated: Boolean(ok), type: type || null };
+}
+
+async function modifyPcbPadNet(params: { primitiveId: string; net?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitivePad?.modify && !api?.pcb_PrimitivePad?.get) {
+    throw new Error('current EDA does not support pcb_PrimitivePad pad updates');
+  }
+  const primitiveId = String(params?.primitiveId || '').trim();
+  if (!primitiveId) throw new Error('primitiveId is required');
+  const net = String(params?.net || '').trim();
+
+  let updated: any;
+  if (api?.pcb_PrimitivePad?.modify) {
+    updated = await api.pcb_PrimitivePad.modify(primitiveId, { net });
+  }
+  if (!updated && api?.pcb_PrimitivePad?.get) {
+    const pad = await api.pcb_PrimitivePad.get(primitiveId);
+    if (!pad) throw new Error(`pad not found: ${primitiveId}`);
+    if (typeof pad.setState_Net !== 'function') {
+      throw new Error('pad object does not expose setState_Net in this runtime');
+    }
+    pad.setState_Net(net || undefined);
+    updated = typeof pad.done === 'function' ? await pad.done() : pad;
+  }
+
+  return {
+    primitiveId,
+    net,
+    updated: Boolean(updated),
+    pad: cloneForBridge(updated),
+  };
+}
+
 async function getFeatureSupport(): Promise<any> {
   const api = anyEda();
   return {
     bridgeVersion: APP_VERSION,
+    developer: {
+      executeJs: true,
+    },
+    project: {
+      getCurrentProjectInfo: Boolean(api?.dmt_Project?.getCurrentProjectInfo),
+      getProjectTree: Boolean(api?.dmt_Project?.getCurrentProjectInfo || api?.dmt_Board?.getAllBoardsInfo || api?.dmt_Schematic?.getAllSchematicsInfo),
+      getCurrentDocumentInfo: Boolean(api?.dmt_SelectControl?.getCurrentDocumentInfo),
+      createBoard: Boolean(api?.dmt_Board?.createBoard),
+      createSchematic: Boolean(api?.dmt_Schematic?.createSchematic),
+      createSchematicPage: Boolean(api?.dmt_Schematic?.createSchematicPage),
+      openDocument: Boolean(api?.dmt_EditorControl?.openDocument),
+    },
+    document: {
+      savePcb: Boolean(api?.pcb_Document?.save),
+      saveSchematic: Boolean(api?.sch_Document?.save),
+      importPcbChanges: Boolean(api?.pcb_Document?.importChanges),
+      clearRouting: Boolean(api?.pcb_Document?.clearRouting),
+    },
+    pcbNet: {
+      getAllNets: Boolean(api?.pcb_Net?.getAllNets),
+      getAllNetsName: Boolean(api?.pcb_Net?.getAllNetsName),
+      getNetlist: Boolean(api?.pcb_Net?.getNetlist),
+      setNetlist: Boolean(api?.pcb_Net?.setNetlist),
+      getAllPrimitivesByNet: Boolean(api?.pcb_Net?.getAllPrimitivesByNet),
+      modifyPadNet: Boolean(api?.pcb_PrimitivePad?.modify || api?.pcb_PrimitivePad?.get),
+    },
     screenshot: {
       renderedAreaImage: Boolean(api?.dmt_EditorControl?.getCurrentRenderedAreaImage),
       exportImage: Boolean(api?.pcb_Document?.exportImage),
@@ -1832,6 +2434,12 @@ async function getFeatureSupport(): Promise<any> {
       getNetlist: Boolean(api?.sch_Netlist?.getNetlist),
       schDrc: Boolean(api?.sch_Drc?.check),
       createPcbComponent: Boolean(api?.pcb_PrimitiveComponent?.create),
+      searchDevices: Boolean(api?.lib_Device?.search),
+      getDevicesByLcscIds: Boolean(api?.lib_Device?.getByLcscIds),
+      createComponent: Boolean(api?.sch_PrimitiveComponent?.create),
+      createNetFlag: Boolean(api?.sch_PrimitiveComponent?.createNetFlag),
+      createNetPort: Boolean(api?.sch_PrimitiveComponent?.createNetPort),
+      createWire: Boolean(api?.sch_PrimitiveWire?.create),
     },
   };
 }
@@ -2180,6 +2788,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'ping':
         data = { message: 'pong', timestamp: Date.now() };
         break;
+      case 'eda_execute':
+        data = await executeEdaCode(cmd.params);
+        break;
       case 'get_state':
         data = await getPCBState();
         break;
@@ -2282,6 +2893,42 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'open_document':
         data = await openDocument(cmd.params);
         break;
+      case 'project_get_tree':
+        data = await getProjectTree();
+        break;
+      case 'dmt_create_board':
+        data = await createBoard(cmd.params);
+        break;
+      case 'dmt_create_schematic':
+        data = await createSchematicDocument(cmd.params);
+        break;
+      case 'dmt_create_schematic_page':
+        data = await createSchematicPage(cmd.params);
+        break;
+      case 'pcb_import_changes':
+        data = await importPcbChanges(cmd.params);
+        break;
+      case 'pcb_save_document':
+        data = await savePcbDocument(cmd.params);
+        break;
+      case 'sch_save_document':
+        data = await saveSchematicDocument();
+        break;
+      case 'pcb_clear_routing':
+        data = await clearPcbRouting(cmd.params);
+        break;
+      case 'pcb_get_nets':
+        data = await getPcbNets(cmd.params);
+        break;
+      case 'pcb_get_netlist':
+        data = await getPcbNetlist(cmd.params);
+        break;
+      case 'pcb_set_netlist':
+        data = await setPcbNetlist(cmd.params);
+        break;
+      case 'pcb_modify_pad_net':
+        data = await modifyPcbPadNet(cmd.params);
+        break;
       case 'get_schematic_state':
         data = await getSchematicState();
         break;
@@ -2293,6 +2940,24 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
         break;
       case 'create_pcb_component':
         data = await createPcbComponent(cmd.params);
+        break;
+      case 'lib_search_devices':
+        data = await searchLibraryDevices(cmd.params);
+        break;
+      case 'lib_get_devices_by_lcsc':
+        data = await getDevicesByLcscIds(cmd.params);
+        break;
+      case 'sch_create_component':
+        data = await createSchematicComponent(cmd.params);
+        break;
+      case 'sch_create_netflag':
+        data = await createSchematicNetFlag(cmd.params);
+        break;
+      case 'sch_create_netport':
+        data = await createSchematicNetPort(cmd.params);
+        break;
+      case 'sch_create_wire':
+        data = await createSchematicWire(cmd.params);
         break;
       default:
         throw new Error(`unknown action: ${cmd.action}`);
@@ -2740,6 +3405,9 @@ export function notifySelectionChanged(detail?: Record<string, unknown>): void {
 }
 
 export function activate(_status?: 'onStartupFinished', _arg?: string): void {
+  if (activationStarted) return;
+  activationStarted = true;
+
   void (async () => {
     try {
       await anyEda()?.sys_HeaderMenu?.replaceHeaderMenus?.((extensionConfig as any).headerMenus);
@@ -2749,16 +3417,20 @@ export function activate(_status?: 'onStartupFinished', _arg?: string): void {
 
     log(`plugin loaded (v${APP_VERSION})`);
 
-    if (readEnabledPref()) {
-      try {
-        await startPolling(true);
-        log('bridge auto-restored to running state');
-      } catch (error) {
-        showError('Auto-restore bridge failed', error);
-      }
-    } else {
-      stopIntervals();
-      bridgeEnabled = false;
+    try {
+      await startPolling(true);
+      await saveEnabledPref(true);
+      log('bridge auto-started');
+    } catch (error) {
+      showError('Auto-start bridge failed', error);
     }
   })();
+}
+
+try {
+  if (typeof eda !== 'undefined') {
+    activate('onStartupFinished');
+  }
+} catch (error) {
+  console.error(`[${APP_NAME}] bootstrap failed`, error);
 }
