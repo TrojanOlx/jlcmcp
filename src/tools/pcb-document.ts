@@ -64,6 +64,16 @@ export function registerPcbDocumentTools(server: any, bridge: BridgeClient) {
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
+  server.tool('pcb_import_auto_route_json', '导入嘉立创 EDA 自动布线 JSON 文件内容', {
+    json: z.string().describe('自动布线 JSON 文件文本'),
+    fileName: z.string().optional().describe('导入时使用的文件名，默认 autoroute.json'),
+  }, async ({ json, fileName }: { json: string; fileName?: string }) => {
+    const params: Record<string, unknown> = { json };
+    if (fileName) params.fileName = fileName;
+    const data = await bridge.command('pcb_import_auto_route_json', params, 120_000);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  });
+
   server.tool('pcb_modify_pad_net', '修改独立 PCB 焊盘网络', {
     primitiveId: z.string().describe('焊盘图元 ID'),
     net: z.string().optional().describe('目标网络名；空值表示清空网络'),

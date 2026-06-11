@@ -2,7 +2,7 @@
 # 本项目上传的文件完全由opus4.6完成，有问题请问agent
 嘉立创 EDA MCP Server — 让 AI 编程助手直接操控嘉立创 EDA 的 PCB 自动化工具集。
 
-通过 [Model Context Protocol](https://modelcontextprotocol.io/) 暴露 39 个 PCB/原理图工具，在 Claude Code / Cursor / Windsurf 等 AI IDE 中直接执行元件移动、走线、铺铜、DRC 等操作。内置 PCB Agent 可自主编排多步操作完成复杂任务。
+通过 [Model Context Protocol](https://modelcontextprotocol.io/) 暴露 50+ 个 PCB/原理图工具，在 Claude Code / Cursor / Windsurf / Codex 等 AI IDE 中直接执行元件移动、走线、铺铜、DRC 等操作。内置 PCB Agent 可自主编排多步操作完成复杂任务。
 
 ## 架构
 
@@ -58,7 +58,7 @@ npm run build
 | `ANTHROPIC_API_KEY` | — | Anthropic API Key（设置后启用 pcb_agent 工具） |
 | `AGENT_MODEL` | `claude-sonnet-4-20250514` | Agent 使用的模型 |
 
-## 工具清单 (39 个)
+## 工具清单 (50+ 个)
 
 ### 状态查询 (9)
 
@@ -67,6 +67,7 @@ npm run build
 | `pcb_get_state` | 获取 PCB 完整状态（元件、网络、板框） |
 | `pcb_screenshot` | 截取编辑器截图（base64 PNG） |
 | `pcb_run_drc` | 运行 PCB 设计规则检查 |
+| `pcb_run_drc_summary` | 运行 PCB DRC 并返回压缩摘要 |
 | `pcb_get_tracks` | 查询走线段，可按网络/层过滤 |
 | `pcb_get_pads` | 查询焊盘信息，可按位号过滤 |
 | `pcb_get_net_primitives` | 查询指定网络的所有图元 |
@@ -90,8 +91,10 @@ npm run build
 | 工具 | 说明 |
 |------|------|
 | `pcb_route_track` | 画走线（指定网络、路径点、层、线宽） |
+| `pcb_set_board_outline_rect` | 重建矩形板框 |
 | `pcb_create_via` | 创建过孔 |
 | `pcb_delete_tracks` | 删除走线 |
+| `pcb_delete_tracks_by_filter` | 按网络/层过滤删除走线 |
 | `pcb_delete_via` | 删除过孔 |
 
 ### 铺铜 / 禁布区 (4)
@@ -121,6 +124,9 @@ npm run build
 | `pcb_create_equal_length` | 创建等长组 |
 | `pcb_list_equal_lengths` | 列出所有等长组 |
 | `pcb_delete_equal_length` | 删除等长组 |
+| `pcb_get_drc_rules` | 读取当前 DRC 规则、网络类、差分对和等长组 |
+| `pcb_create_net_class` | 创建 PCB 网络类 |
+| `pcb_list_net_classes` | 列出 PCB 网络类 |
 
 ### 原理图 / 文档 (4)
 
@@ -130,6 +136,14 @@ npm run build
 | `sch_get_netlist` | 导出网表 |
 | `sch_run_drc` | 运行原理图 DRC |
 | `pcb_open_document` | 切换到指定文档（原理图或 PCB） |
+| `pcb_import_auto_route_json` | 导入嘉立创 EDA 自动布线 JSON 文件内容 |
+
+### Developer / 调试工具
+
+| 工具 | 说明 |
+|------|------|
+| `eda_execute_js` | 在嘉立创 EDA 扩展运行时执行受信任 JS |
+| `eda_introspect_api` | 探测运行时 API 对象和原型方法 |
 
 ### PCB Agent (1)
 
@@ -232,6 +246,9 @@ npm run build    # 编译 + 打包为 .eext
 
 > 创建 USB 差分对
   → 调用 pcb_create_diff_pair {name:"USB", posNet:"USB_DP", negNet:"USB_DN"}
+
+> 查看 DRC 摘要
+  → 调用 pcb_run_drc_summary {limit:50}
 
 > 分析当前布局并给出优化建议
   → 调用 pcb_agent {task:"分析当前布局并给出优化建议"}

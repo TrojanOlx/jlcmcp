@@ -2623,8 +2623,15 @@ async function getFeatureSupport(): Promise<any> {
     routingRules: {
       differentialPair: Boolean(api?.pcb_Drc?.createDifferentialPair),
       equalLengthGroup: Boolean(api?.pcb_Drc?.createEqualLengthNetGroup),
+      netClass: Boolean(api?.pcb_Drc?.createNetClass && api?.pcb_Drc?.getAllNetClasses),
+      getRules: Boolean(api?.pcb_Drc?.getCurrentRuleConfiguration && api?.pcb_Drc?.getNetRules),
       drcCheck: Boolean(api?.pcb_Drc?.check || api?.pcb_Drc?.runDrc),
       padPairGroup: Boolean(api?.pcb_Drc?.createPadPairGroup),
+    },
+    autoroute: {
+      importAutoRouteJsonFile: Boolean(api?.pcb_Document?.importAutoRouteJsonFile),
+      importAutoRouteSesFile: Boolean(api?.pcb_Document?.importAutoRouteSesFile),
+      importAutoLayoutJsonFile: Boolean(api?.pcb_Document?.importAutoLayoutJsonFile),
     },
     schematic: {
       getBoardInfo: Boolean(api?.dmt_Board?.getCurrentBoardInfo),
@@ -2674,6 +2681,54 @@ async function deleteTracks(params: { primitiveId?: string; primitiveIds?: strin
   return {
     deleted: Boolean(ok),
     primitiveIds: Array.isArray(primitiveIds) ? primitiveIds : [primitiveIds],
+  };
+}
+
+async function deleteTracksByFilter(params: {
+  net?: string;
+  layer?: number;
+  includeBoardOutline?: boolean;
+  includeNoNet?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitiveLine?.getAll || !api?.pcb_PrimitiveLine?.delete) {
+    throw new Error('current EDA does not support track query/delete');
+  }
+
+  const layer = params?.layer === undefined ? undefined : Number(params.layer);
+  const netFilter = params?.net === undefined ? undefined : String(params.net || '').trim();
+  const includeBoardOutline = Boolean(params?.includeBoardOutline);
+  const includeNoNet = Boolean(params?.includeNoNet);
+  const rows = await api.pcb_PrimitiveLine.getAll(netFilter || undefined, Number.isFinite(layer) ? layer : undefined);
+  const toDelete: string[] = [];
+  const skipped: any[] = [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const primitiveId = readFirstStringAny(row, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']);
+    if (!primitiveId) continue;
+    const rowLayer = readFirstNumberAny(row, ['getState_Layer'], ['layer']);
+    const rowNet = readFirstStringAny(row, ['getState_Net', 'getState_NetName'], ['net', 'netName']);
+    const isBoardOutline = Number(rowLayer) === 11;
+    if (isBoardOutline && !includeBoardOutline) {
+      skipped.push({ primitiveId, reason: 'board outline' });
+      continue;
+    }
+    if (!rowNet && !includeNoNet && !isBoardOutline) {
+      skipped.push({ primitiveId, reason: 'empty net' });
+      continue;
+    }
+    toDelete.push(primitiveId);
+  }
+
+  if (toDelete.length > 0) {
+    await api.pcb_PrimitiveLine.delete(toDelete as any);
+  }
+
+  return {
+    deletedCount: toDelete.length,
+    deletedPrimitiveIds: toDelete,
+    skippedCount: skipped.length,
+    skipped,
   };
 }
 
@@ -2861,6 +2916,56 @@ async function routeTrack(params: { net: string; points: any[]; layer: number; w
   return { createdSegments: created };
 }
 
+async function setBoardOutlineRect(params: { x1: number; y1: number; x2: number; y2: number }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitiveLine?.getAll || !api?.pcb_PrimitiveLine?.delete || !api?.pcb_PrimitiveLine?.create) {
+    throw new Error('current EDA does not support board outline update');
+  }
+
+  const x1 = Number(params.x1);
+  const y1 = Number(params.y1);
+  const x2 = Number(params.x2);
+  const y2 = Number(params.y2);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) {
+    throw new Error('x1/y1/x2/y2 must be finite numbers');
+  }
+
+  const oldRows = await api.pcb_PrimitiveLine.getAll(undefined, 11);
+  const oldIds = (Array.isArray(oldRows) ? oldRows : [])
+    .map((row: any) => readFirstStringAny(row, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']))
+    .filter(Boolean);
+  if (oldIds.length > 0) {
+    await api.pcb_PrimitiveLine.delete(oldIds as any);
+  }
+
+  const left = Math.min(x1, x2);
+  const right = Math.max(x1, x2);
+  const top = Math.min(y1, y2);
+  const bottom = Math.max(y1, y2);
+  const points = [
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: right, y: bottom },
+    { x: left, y: bottom },
+    { x: left, y: top },
+  ];
+  const createdPrimitiveIds: string[] = [];
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i];
+    const b = points[i + 1];
+    const line = await api.pcb_PrimitiveLine.create('', 11, a.x, a.y, b.x, b.y, 0, false);
+    const id = readFirstStringAny(line, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']);
+    if (id) createdPrimitiveIds.push(id);
+  }
+
+  return {
+    deletedOutlineCount: oldIds.length,
+    createdOutlineCount: createdPrimitiveIds.length,
+    createdPrimitiveIds,
+    rect: { x1: left, y1: top, x2: right, y2: bottom },
+  };
+}
+
 async function runDRC(): Promise<any> {
   const api = anyEda();
   if (!api?.pcb_Drc?.check && !api?.pcb_Drc?.runDrc) {
@@ -2945,6 +3050,157 @@ async function runDRC(): Promise<any> {
   };
 }
 
+function collectDrcLeafIssues(node: any, inherited: Record<string, any> = {}, out: any[] = []): any[] {
+  if (!node || typeof node !== 'object') return out;
+  const next = { ...inherited };
+  if (typeof node.name === 'string' && node.name.trim()) next.group = node.name;
+  if (Array.isArray(node.title)) next.title = node.title.join(' ');
+  else if (typeof node.title === 'string') next.title = node.title;
+
+  if (Array.isArray(node.list)) {
+    for (const child of node.list) collectDrcLeafIssues(child, next, out);
+    return out;
+  }
+
+  const errData = node?.explanation?.errData || {};
+  const objs = Array.isArray(node.objs) ? node.objs : [];
+  const obj1Suffix = errData.obj1Suffix || node?.obj1?.suffix || '';
+  const obj2Suffix = errData.obj2Suffix || node?.obj2?.suffix || '';
+  const suffixText = `${obj1Suffix} ${obj2Suffix}`;
+  const netMatches = Array.from(suffixText.matchAll(/\(([^)]+)\)/g)).map((match: RegExpMatchArray) => String(match[1] || '').trim()).filter(Boolean);
+
+  out.push({
+    severity: String(node.errorType || inherited.group || '').toLowerCase().includes('error') ? 'error' : 'unknown',
+    rule: node.ruleName || errData.name || inherited.group || '',
+    ruleType: node.ruleTypeName || errData.errorType || '',
+    objectType: node.errorObjType || '',
+    layer: node.layer || '',
+    globalIndex: node.globalIndex || errData.globalIndex || '',
+    position: node.pos || errData.position || null,
+    minDistance: node?.explanation?.param?.minDistance || undefined,
+    shouldBe: node?.explanation?.param?.shouldBe || undefined,
+    nets: [...new Set(netMatches)],
+    primitiveIds: objs,
+    obj1: obj1Suffix,
+    obj2: obj2Suffix,
+    group: inherited.group || '',
+    title: inherited.title || '',
+  });
+  return out;
+}
+
+async function summarizeDRC(params?: { limit?: number }): Promise<any> {
+  const result = await runDRC();
+  const limitRaw = Number(params?.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 100;
+  const leaves: any[] = [];
+  for (const issue of result.issues || []) {
+    collectDrcLeafIssues(issue.raw, { group: issue.rule }, leaves);
+  }
+
+  const countBy = (key: string) => {
+    const counts = new Map<string, number>();
+    for (const item of leaves) {
+      const raw = item[key];
+      const values = Array.isArray(raw) ? raw : [raw || '(unknown)'];
+      for (const value of values) counts.set(String(value || '(unknown)'), (counts.get(String(value || '(unknown)')) || 0) + 1);
+    }
+    return Array.from(counts.entries()).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+  };
+
+  return {
+    passed: result.passed,
+    topLevel: result.summary,
+    leafIssueCount: leaves.length,
+    byRule: countBy('rule'),
+    byObjectType: countBy('objectType'),
+    byNet: countBy('nets'),
+    issues: leaves.slice(0, limit),
+    truncated: leaves.length > limit,
+  };
+}
+
+async function getDrcRules(): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Drc) throw new Error('current EDA does not support pcb_Drc');
+  const safeCall = async (name: string, ...args: any[]) => {
+    try {
+      const fn = api.pcb_Drc?.[name];
+      if (typeof fn !== 'function') return { supported: false };
+      return cloneForBridge(await fn.apply(api.pcb_Drc, args));
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  return {
+    currentRuleConfigurationName: await safeCall('getCurrentRuleConfigurationName'),
+    defaultRuleConfigurationName: await safeCall('getDefaultRuleConfigurationName'),
+    currentRuleConfiguration: await safeCall('getCurrentRuleConfiguration'),
+    netRules: await safeCall('getNetRules'),
+    netByNetRules: await safeCall('getNetByNetRules'),
+    netClasses: await safeCall('getAllNetClasses'),
+    differentialPairs: await safeCall('getAllDifferentialPairs'),
+    equalLengthGroups: await safeCall('getAllEqualLengthNetGroups'),
+    padPairGroups: await safeCall('getAllPadPairGroups'),
+  };
+}
+
+async function createNetClass(params: { name: string; nets: string[]; color?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Drc?.createNetClass) {
+    throw new Error('current EDA does not support net class creation');
+  }
+  const name = String(params?.name || '').trim();
+  const nets = Array.isArray(params?.nets) ? params.nets.map((net) => String(net || '').trim()).filter(Boolean) : [];
+  if (!name) throw new Error('name is required');
+  if (nets.length === 0) throw new Error('nets is required');
+  const color = String(params?.color || '').trim() || undefined;
+  const result = await api.pcb_Drc.createNetClass(name, nets, color);
+  return { created: Boolean(result), name, nets, color: color || null };
+}
+
+async function listNetClasses(): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Drc?.getAllNetClasses) {
+    throw new Error('current EDA does not support net class query');
+  }
+  const netClasses = await api.pcb_Drc.getAllNetClasses();
+  return { netClasses: cloneForBridge(netClasses), count: Array.isArray(netClasses) ? netClasses.length : 0 };
+}
+
+async function importAutoRouteJson(params: { json: string; fileName?: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_Document?.importAutoRouteJsonFile) {
+    throw new Error('current EDA does not support AutoRoute JSON import');
+  }
+  const text = String(params?.json || '').trim();
+  if (!text) throw new Error('json is required');
+  JSON.parse(text);
+  const fileName = String(params?.fileName || 'autoroute.json').trim() || 'autoroute.json';
+  const file = new File([text], fileName, { type: 'application/json' });
+  const imported = await api.pcb_Document.importAutoRouteJsonFile(file);
+  return { imported: Boolean(imported), fileName, bytes: text.length };
+}
+
+async function introspectEdaApi(params?: { names?: string[] }): Promise<any> {
+  const api = anyEda();
+  const names = Array.isArray(params?.names) && params.names.length > 0
+    ? params.names.map((name) => String(name || '').trim()).filter(Boolean)
+    : Object.keys(api || {}).sort();
+  const entries: Record<string, any> = {};
+  for (const name of names) {
+    const obj = api?.[name];
+    const proto = obj ? Object.getPrototypeOf(obj) : null;
+    entries[name] = {
+      type: typeof obj,
+      own: obj ? Object.getOwnPropertyNames(obj).sort() : [],
+      prototype: proto ? Object.getOwnPropertyNames(proto).sort() : [],
+    };
+  }
+  return { entries };
+}
+
 async function takeScreenshot(): Promise<any> {
   const api = anyEda();
 
@@ -2990,6 +3246,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'eda_execute':
         data = await executeEdaCode(cmd.params);
         break;
+      case 'eda_introspect_api':
+        data = await introspectEdaApi(cmd.params);
+        break;
       case 'get_state':
         data = await getPCBState();
         break;
@@ -3014,6 +3273,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'route_track':
         data = await routeTrack(cmd.params);
         break;
+      case 'set_board_outline_rect':
+        data = await setBoardOutlineRect(cmd.params);
+        break;
       case 'create_via':
         data = await createVia(cmd.params);
         break;
@@ -3025,6 +3287,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
         break;
       case 'delete_tracks':
         data = await deleteTracks(cmd.params);
+        break;
+      case 'delete_tracks_by_filter':
+        data = await deleteTracksByFilter(cmd.params);
         break;
       case 'get_net_primitives':
         data = await getNetPrimitives(cmd.params);
@@ -3062,8 +3327,20 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'list_equal_length_groups':
         data = await listEqualLengthGroups();
         break;
+      case 'create_net_class':
+        data = await createNetClass(cmd.params);
+        break;
+      case 'list_net_classes':
+        data = await listNetClasses();
+        break;
+      case 'get_drc_rules':
+        data = await getDrcRules();
+        break;
       case 'run_drc':
         data = await runDRC();
+        break;
+      case 'summarize_drc':
+        data = await summarizeDRC(cmd.params);
         break;
       case 'get_pads':
         data = await getPads(cmd.params);
@@ -3127,6 +3404,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
         break;
       case 'pcb_set_netlist':
         data = await setPcbNetlist(cmd.params);
+        break;
+      case 'pcb_import_auto_route_json':
+        data = await importAutoRouteJson(cmd.params);
         break;
       case 'pcb_modify_pad_net':
         data = await modifyPcbPadNet(cmd.params);

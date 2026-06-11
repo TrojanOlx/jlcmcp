@@ -20,6 +20,15 @@ export function registerStateTools(server: any, bridge: BridgeClient) {
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
 
+  server.tool('pcb_run_drc_summary', '运行 PCB DRC 并返回压缩摘要', {
+    limit: z.number().int().positive().optional().describe('返回的明细上限，默认 100'),
+  }, async ({ limit }: { limit?: number }) => {
+    const params: Record<string, unknown> = {};
+    if (limit !== undefined) params.limit = limit;
+    const data = await bridge.command('summarize_drc', params, 120_000);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  });
+
   server.tool('pcb_get_tracks', '查询走线段', {
     net: z.string().optional().describe('网络名称（可选）'),
     layer: z.number().optional().describe('层号（可选）'),

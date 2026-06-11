@@ -13,4 +13,13 @@ export function registerDeveloperTools(server: any, bridge: BridgeClient) {
     const data = await bridge.command('eda_execute', payload);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
+
+  server.tool('eda_introspect_api', '探测嘉立创 EDA 扩展运行时 API 方法', {
+    names: z.array(z.string()).optional().describe('要探测的 eda API 对象名列表，如 pcb_Drc、pcb_Document；不填则列出可枚举对象'),
+  }, async ({ names }: { names?: string[] }) => {
+    const params: Record<string, unknown> = {};
+    if (names !== undefined) params.names = names;
+    const data = await bridge.command('eda_introspect_api', params, 120_000);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  });
 }
