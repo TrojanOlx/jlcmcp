@@ -1478,6 +1478,7 @@ async function createVia(params: {
   net: string;
   x: number;
   y: number;
+  drill?: number;
   holeDiameter?: number;
   diameter?: number;
   viaType?: number;
@@ -1495,7 +1496,7 @@ async function createVia(params: {
   const y = toFinite(params?.y, NaN);
   if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x/y are required');
 
-  const holeDiameter = Math.max(1, toFinite(params?.holeDiameter, 10));
+  const holeDiameter = Math.max(1, toFinite(params?.holeDiameter ?? params?.drill, 10));
   const diameter = Math.max(holeDiameter + 1, toFinite(params?.diameter, 22));
   const viaType = Number.isFinite(Number(params?.viaType)) ? Number(params.viaType) : undefined;
   const primitiveLock = params?.primitiveLock !== undefined ? Boolean(params.primitiveLock) : false;
@@ -1733,15 +1734,15 @@ async function deletePour(params: { primitiveId?: string; primitiveIds?: string[
   };
 }
 
-async function createDifferentialPair(params: { name: string; positiveNet: string; negativeNet: string }): Promise<any> {
+async function createDifferentialPair(params: { name: string; positiveNet?: string; negativeNet?: string; posNet?: string; negNet?: string }): Promise<any> {
   const api = anyEda();
   if (!api?.pcb_Drc?.createDifferentialPair) {
     throw new Error('current EDA does not support differential pair');
   }
 
   const name = String(params?.name || '').trim();
-  const positiveNet = String(params?.positiveNet || '').trim();
-  const negativeNet = String(params?.negativeNet || '').trim();
+  const positiveNet = String(params?.positiveNet || params?.posNet || '').trim();
+  const negativeNet = String(params?.negativeNet || params?.negNet || '').trim();
   if (!name || !positiveNet || !negativeNet) {
     throw new Error('name/positiveNet/negativeNet are required');
   }
@@ -3156,8 +3157,14 @@ async function createNetClass(params: { name: string; nets: string[]; color?: st
   if (!name) throw new Error('name is required');
   if (nets.length === 0) throw new Error('nets is required');
   const color = String(params?.color || '').trim() || undefined;
-  const result = await api.pcb_Drc.createNetClass(name, nets, color);
-  return { created: Boolean(result), name, nets, color: color || null };
+  const result = await api.pcb_Drc.createNetClass(name, color);
+  const addResults = [];
+  if (api?.pcb_Drc?.addNetToNetClass) {
+    for (const net of nets) {
+      addResults.push({ net, added: Boolean(await api.pcb_Drc.addNetToNetClass(name, net)) });
+    }
+  }
+  return { created: Boolean(result), name, nets, color: color || null, addResults };
 }
 
 async function listNetClasses(): Promise<any> {
