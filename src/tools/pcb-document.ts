@@ -73,4 +73,31 @@ export function registerPcbDocumentTools(server: any, bridge: BridgeClient) {
     const data = await bridge.command('pcb_modify_pad_net', params);
     return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
   });
+
+  server.tool('pcb_get_component_pins', '读取 PCB 元件焊盘坐标和网络', {
+    designator: z.string().optional().describe('元件位号；不填则读取全部元件'),
+    includeEmptyNets: z.boolean().optional().describe('是否返回空网络焊盘，默认 true'),
+  }, async ({ designator, includeEmptyNets }: { designator?: string; includeEmptyNets?: boolean }) => {
+    const params: Record<string, unknown> = {};
+    if (designator !== undefined) params.designator = designator;
+    if (includeEmptyNets !== undefined) params.includeEmptyNets = includeEmptyNets;
+    const data = await bridge.command('pcb_get_component_pins', params, 120_000);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool('pcb_assign_pad_nets_by_designator', '按元件位号批量修改 PCB 焊盘网络', {
+    designator: z.string().describe('元件位号，如 U1、J1'),
+    assignments: z.array(z.object({
+      primitiveId: z.string().optional().describe('焊盘图元 ID；优先使用'),
+      pinIndex: z.number().int().nonnegative().optional().describe('0 基焊盘序号'),
+      padIndex: z.number().int().positive().optional().describe('1 基焊盘序号'),
+      net: z.string().optional().describe('目标网络名；空值表示清空网络'),
+    })).describe('焊盘网络修改列表'),
+  }, async ({ designator, assignments }: {
+    designator: string;
+    assignments: { primitiveId?: string; pinIndex?: number; padIndex?: number; net?: string }[];
+  }) => {
+    const data = await bridge.command('pcb_assign_pad_nets_by_designator', { designator, assignments }, 120_000);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  });
 }

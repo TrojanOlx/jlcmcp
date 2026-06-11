@@ -211,6 +211,28 @@ function readFirstStringValue(target: any, getterNames: string[]): string {
   return '';
 }
 
+function readFirstStringField(target: any, fieldNames: string[]): string {
+  for (const fieldName of fieldNames) {
+    try {
+      const raw = target?.[fieldName];
+      if (typeof raw === 'string') {
+        const text = raw.trim();
+        if (text) return text;
+      } else if (raw !== undefined && raw !== null && typeof raw !== 'function') {
+        const text = String(raw).trim();
+        if (text) return text;
+      }
+    } catch {
+      // ignore field errors
+    }
+  }
+  return '';
+}
+
+function readFirstStringAny(target: any, getterNames: string[], fieldNames: string[]): string {
+  return readFirstStringValue(target, getterNames) || readFirstStringField(target, fieldNames);
+}
+
 function readFirstNumberValue(target: any, getterNames: string[]): number | undefined {
   for (const getterName of getterNames) {
     try {
@@ -223,6 +245,22 @@ function readFirstNumberValue(target: any, getterNames: string[]): number | unde
     }
   }
   return undefined;
+}
+
+function readFirstNumberField(target: any, fieldNames: string[]): number | undefined {
+  for (const fieldName of fieldNames) {
+    try {
+      const value = Number(target?.[fieldName]);
+      if (Number.isFinite(value)) return value;
+    } catch {
+      // ignore field errors
+    }
+  }
+  return undefined;
+}
+
+function readFirstNumberAny(target: any, getterNames: string[], fieldNames: string[]): number | undefined {
+  return readFirstNumberValue(target, getterNames) ?? readFirstNumberField(target, fieldNames);
 }
 
 function readFirstBooleanValue(target: any, getterNames: string[]): boolean | undefined {
@@ -2369,6 +2407,165 @@ async function modifyPcbPadNet(params: { primitiveId: string; net?: string }): P
   };
 }
 
+type ComponentPinInfo = {
+  index: number;
+  primitiveId: string;
+  pin: string;
+  net: string;
+  x: number | null;
+  y: number | null;
+  layer?: number | string;
+};
+
+async function findPcbComponentByDesignator(designator: string): Promise<{ row: any; primitiveId: string; designator: string }> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitiveComponent?.getAll) {
+    throw new Error('current EDA does not support component query');
+  }
+
+  const expected = String(designator || '').trim();
+  if (!expected) throw new Error('designator is required');
+
+  const rows = await api.pcb_PrimitiveComponent.getAll();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const actualDesignator = readFirstStringAny(row, ['getState_Designator'], ['designator', 'prefix', 'name']);
+    if (actualDesignator !== expected) continue;
+    const primitiveId = readFirstStringAny(row, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']);
+    if (!primitiveId) throw new Error(`component ${expected} has no primitive id`);
+    return { row, primitiveId, designator: actualDesignator };
+  }
+
+  throw new Error(`component not found: ${expected}`);
+}
+
+function serializePcbComponentPin(pin: any, index: number): ComponentPinInfo {
+  const x = readFirstNumberAny(pin, ['getState_X', 'getState_CenterX', 'getState_PosX'], ['x', 'centerX', 'posX']);
+  const y = readFirstNumberAny(pin, ['getState_Y', 'getState_CenterY', 'getState_PosY'], ['y', 'centerY', 'posY']);
+  const layerRaw = readFirstNumberAny(pin, ['getState_Layer'], ['layer']);
+  const layerText = readFirstStringAny(pin, ['getState_Layer'], ['layer']);
+
+  return {
+    index,
+    primitiveId: readFirstStringAny(pin, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']),
+    pin: readFirstStringAny(pin, ['getState_Pin', 'getState_Number', 'getState_Name', 'getState_PinName'], ['pin', 'number', 'name', 'pinName']),
+    net: readFirstStringAny(pin, ['getState_Net', 'getState_NetName'], ['net', 'netName']),
+    x: Number.isFinite(x) ? Number(x) : null,
+    y: Number.isFinite(y) ? Number(y) : null,
+    layer: Number.isFinite(layerRaw) ? Number(layerRaw) : layerText || undefined,
+  };
+}
+
+async function getPcbComponentPins(params?: { designator?: string; includeEmptyNets?: boolean }): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitiveComponent?.getAll || !api?.pcb_PrimitiveComponent?.getAllPinsByPrimitiveId) {
+    throw new Error('current EDA does not support component pin query');
+  }
+
+  const designatorFilter = String(params?.designator || '').trim();
+  const includeEmptyNets = params?.includeEmptyNets !== false;
+  const rows = await api.pcb_PrimitiveComponent.getAll();
+  const components: any[] = [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const designator = readFirstStringAny(row, ['getState_Designator'], ['designator', 'prefix', 'name']);
+    if (designatorFilter && designator !== designatorFilter) continue;
+
+    const primitiveId = readFirstStringAny(row, ['getState_PrimitiveId'], ['primitiveId', 'id', 'uuid']);
+    if (!primitiveId) continue;
+
+    const rawPins = await api.pcb_PrimitiveComponent.getAllPinsByPrimitiveId(primitiveId);
+    const pins = (Array.isArray(rawPins) ? rawPins : [])
+      .map((pin: any, index: number) => serializePcbComponentPin(pin, index))
+      .filter((pin: ComponentPinInfo) => includeEmptyNets || Boolean(pin.net));
+
+    components.push({
+      designator,
+      primitiveId,
+      x: readFirstNumberAny(row, ['getState_X', 'getState_CenterX'], ['x', 'centerX']),
+      y: readFirstNumberAny(row, ['getState_Y', 'getState_CenterY'], ['y', 'centerY']),
+      rotation: readFirstNumberAny(row, ['getState_Rotation'], ['rotation']),
+      pinCount: pins.length,
+      pins,
+    });
+  }
+
+  return {
+    componentCount: components.length,
+    totalPins: components.reduce((sum, component) => sum + Number(component.pinCount || 0), 0),
+    components,
+  };
+}
+
+async function assignPcbPadNetsByDesignator(params: {
+  designator: string;
+  assignments: { primitiveId?: string; pinIndex?: number; padIndex?: number; net?: string }[];
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.pcb_PrimitiveComponent?.getAllPinsByPrimitiveId || !api?.pcb_PrimitivePad?.modify) {
+    throw new Error('current EDA does not support component pin net assignment');
+  }
+
+  const assignments = Array.isArray(params?.assignments) ? params.assignments : [];
+  if (assignments.length === 0) throw new Error('assignments is required');
+
+  const component = await findPcbComponentByDesignator(params.designator);
+  const rawPins = await api.pcb_PrimitiveComponent.getAllPinsByPrimitiveId(component.primitiveId);
+  const pins = (Array.isArray(rawPins) ? rawPins : []).map((pin: any, index: number) => serializePcbComponentPin(pin, index));
+  const byPrimitiveId = new Map(pins.filter((pin) => pin.primitiveId).map((pin) => [pin.primitiveId, pin]));
+
+  const updated: any[] = [];
+  const failed: any[] = [];
+
+  for (const assignment of assignments) {
+    const primitiveId = String(assignment?.primitiveId || '').trim();
+    const pinIndex = Number(assignment?.pinIndex);
+    const padIndex = Number(assignment?.padIndex);
+    const target = primitiveId
+      ? byPrimitiveId.get(primitiveId)
+      : Number.isInteger(pinIndex) && pinIndex >= 0
+      ? pins[pinIndex]
+      : Number.isInteger(padIndex) && padIndex > 0
+      ? pins[padIndex - 1]
+      : undefined;
+
+    if (!target?.primitiveId) {
+      failed.push({ assignment, error: 'target pad not found' });
+      continue;
+    }
+
+    const net = String(assignment?.net || '').trim();
+    try {
+      const result = await api.pcb_PrimitivePad.modify(target.primitiveId, { net });
+      updated.push({
+        primitiveId: target.primitiveId,
+        pinIndex: target.index,
+        padIndex: target.index + 1,
+        previousNet: target.net,
+        net,
+        updated: Boolean(result),
+      });
+    } catch (error) {
+      failed.push({
+        primitiveId: target.primitiveId,
+        pinIndex: target.index,
+        padIndex: target.index + 1,
+        net,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    designator: component.designator,
+    primitiveId: component.primitiveId,
+    requested: assignments.length,
+    updatedCount: updated.length,
+    failedCount: failed.length,
+    updated,
+    failed,
+  };
+}
+
 async function getFeatureSupport(): Promise<any> {
   const api = anyEda();
   return {
@@ -2398,6 +2595,8 @@ async function getFeatureSupport(): Promise<any> {
       setNetlist: Boolean(api?.pcb_Net?.setNetlist),
       getAllPrimitivesByNet: Boolean(api?.pcb_Net?.getAllPrimitivesByNet),
       modifyPadNet: Boolean(api?.pcb_PrimitivePad?.modify || api?.pcb_PrimitivePad?.get),
+      getComponentPins: Boolean(api?.pcb_PrimitiveComponent?.getAllPinsByPrimitiveId),
+      assignPadNetsByDesignator: Boolean(api?.pcb_PrimitiveComponent?.getAllPinsByPrimitiveId && api?.pcb_PrimitivePad?.modify),
     },
     screenshot: {
       renderedAreaImage: Boolean(api?.dmt_EditorControl?.getCurrentRenderedAreaImage),
@@ -2869,6 +3068,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'get_pads':
         data = await getPads(cmd.params);
         break;
+      case 'pcb_get_component_pins':
+        data = await getPcbComponentPins(cmd.params);
+        break;
       case 'select_component': {
         const api = anyEda();
         if (!api?.pcb_SelectControl?.selectByDesignator) {
@@ -2928,6 +3130,9 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
         break;
       case 'pcb_modify_pad_net':
         data = await modifyPcbPadNet(cmd.params);
+        break;
+      case 'pcb_assign_pad_nets_by_designator':
+        data = await assignPcbPadNetsByDesignator(cmd.params);
         break;
       case 'get_schematic_state':
         data = await getSchematicState();
